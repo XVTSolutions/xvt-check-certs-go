@@ -7,16 +7,14 @@ package main
 import (
 	"crypto/tls"
 	"crypto/x509"
-	"flag"
+	"encoding/json"
 	"fmt"
-	"io/ioutil"
+	"github.com/gorilla/mux"
 	"log"
-	"strings"
-	"sync"
+	"net/http"
+	"strconv"
 	"time"
 )
-
-const defaultConcurrency = 8
 
 const (
 	errExpiringShortly = "%s: ** '%s' (S/N %X) expires in %d hours! **"
@@ -28,6 +26,8 @@ type sigAlgSunset struct {
 	name      string    // Human readable name of signature algorithm
 	sunsetsAt time.Time // Time the algorithm will be sunset
 }
+
+var checkSigAlg = true
 
 // sunsetSigAlgs is an algorithm to string mapping for signature algorithms
 // which have been or are being deprecated.  See the following links to learn
@@ -58,15 +58,6 @@ var sunsetSigAlgs = map[x509.SignatureAlgorithm]sigAlgSunset{
 	},
 }
 
-var (
-	hostsFile   = flag.String("hosts", "", "The path to the file containing a list of hosts to check.")
-	warnYears   = flag.Int("years", 0, "Warn if the certificate will expire within this many years.")
-	warnMonths  = flag.Int("months", 0, "Warn if the certificate will expire within this many months.")
-	warnDays    = flag.Int("days", 0, "Warn if the certificate will expire within this many days.")
-	checkSigAlg = flag.Bool("check-sig-alg", true, "Verify that non-root certificates are using a good signature algorithm.")
-	concurrency = flag.Int("concurrency", defaultConcurrency, "Maximum number of hosts to check at once.")
-)
-
 type certErrors struct {
 	commonName string
 	errs       []error
@@ -78,101 +69,47 @@ type hostResult struct {
 	certs []certErrors
 }
 
+type JsonResponse struct {
+	Name string `json:"name"`
+	Message string `json:"message"`
+}
+
+type JsonResponses []JsonResponse
+
 func main() {
-	flag.Parse()
+	r:= mux.NewRouter()
+	r.HandleFunc("/check/{host}/{days}", CertificateHandler)
 
-	if len(*hostsFile) == 0 {
-		flag.Usage()
-		return
-	}
-	if *warnYears < 0 {
-		*warnYears = 0
-	}
-	if *warnMonths < 0 {
-		*warnMonths = 0
-	}
-	if *warnDays < 0 {
-		*warnDays = 0
-	}
-	if *warnYears == 0 && *warnMonths == 0 && *warnDays == 0 {
-		*warnDays = 30
-	}
-	if *concurrency < 0 {
-		*concurrency = defaultConcurrency
-	}
-
-	processHosts()
+	log.Fatal(http.ListenAndServe(":8000", r))
 }
 
-func processHosts() {
-	done := make(chan struct{})
-	defer close(done)
+func CertificateHandler(w http.ResponseWriter, r *http.Request) {
+	vars := mux.Vars(r)
+	warnDays, err := strconv.Atoi(vars["days"])
 
-	hosts := queueHosts(done)
-	results := make(chan hostResult)
-
-	var wg sync.WaitGroup
-	wg.Add(*concurrency)
-	for i := 0; i < *concurrency; i++ {
-		go func() {
-			processQueue(done, hosts, results)
-			wg.Done()
-		}()
+	if err != nil {
+		panic(err)
 	}
-	go func() {
-		wg.Wait()
-		close(results)
-	}()
 
-	for r := range results {
-		if r.err != nil {
-			log.Printf("%s: %v\n", r.host, r.err)
-			continue
-		}
-		for _, cert := range r.certs {
-			for _, err := range cert.errs {
-				log.Println(err)
+	result := checkHost(vars["host"], warnDays)
+
+	w.WriteHeader(http.StatusOK)
+	w.Header().Set("Content-Type", "application/json")
+
+	if result.err != nil {
+		json.NewEncoder(w).Encode(result.err)
+	} else {
+		var response JsonResponses
+		for _, cert :=  range result.certs {
+			for _, certErr := range cert.errs {
+				response = append(response, JsonResponse{cert.commonName,certErr.Error()})
 			}
 		}
+		json.NewEncoder(w).Encode(response)
 	}
 }
 
-func queueHosts(done <-chan struct{}) <-chan string {
-	hosts := make(chan string)
-	go func() {
-		defer close(hosts)
-
-		fileContents, err := ioutil.ReadFile(*hostsFile)
-		if err != nil {
-			return
-		}
-		lines := strings.Split(string(fileContents), "\n")
-		for _, line := range lines {
-			host := strings.TrimSpace(line)
-			if len(host) == 0 || host[0] == '#' {
-				continue
-			}
-			select {
-			case hosts <- host:
-			case <-done:
-				return
-			}
-		}
-	}()
-	return hosts
-}
-
-func processQueue(done <-chan struct{}, hosts <-chan string, results chan<- hostResult) {
-	for host := range hosts {
-		select {
-		case results <- checkHost(host):
-		case <-done:
-			return
-		}
-	}
-}
-
-func checkHost(host string) (result hostResult) {
+func checkHost(host string, warnDays int) (result hostResult) {
 	result = hostResult{
 		host:  host,
 		certs: []certErrors{},
@@ -195,7 +132,7 @@ func checkHost(host string) (result hostResult) {
 			cErrs := []error{}
 
 			// Check the expiration.
-			if timeNow.AddDate(*warnYears, *warnMonths, *warnDays).After(cert.NotAfter) {
+			if timeNow.AddDate(0, 0, warnDays).After(cert.NotAfter) {
 				expiresIn := int64(cert.NotAfter.Sub(timeNow).Hours())
 				if expiresIn <= 48 {
 					cErrs = append(cErrs, fmt.Errorf(errExpiringShortly, host, cert.Subject.CommonName, cert.SerialNumber, expiresIn))
@@ -205,7 +142,7 @@ func checkHost(host string) (result hostResult) {
 			}
 
 			// Check the signature algorithm, ignoring the root certificate.
-			if alg, exists := sunsetSigAlgs[cert.SignatureAlgorithm]; *checkSigAlg && exists && certNum != len(chain)-1 {
+			if alg, exists := sunsetSigAlgs[cert.SignatureAlgorithm]; checkSigAlg && exists && certNum != len(chain)-1 {
 				if cert.NotAfter.Equal(alg.sunsetsAt) || cert.NotAfter.After(alg.sunsetsAt) {
 					cErrs = append(cErrs, fmt.Errorf(errSunsetAlg, host, cert.Subject.CommonName, cert.SerialNumber, alg.name))
 				}
