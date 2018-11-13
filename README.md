@@ -1,5 +1,7 @@
-go-check-certs
-==============
+xvt-check-certs-go
+===================
+
+This app is a fork of [Ryan Rogers' go-check-certs](https://github.com/timewasted/go-check-certs) which checks the expiry dates and signature algorithms of an SSL certificate for a given host.
 
 This is a simple utility written in Go to check SSL certificates for a list of hosts. Each certificate in the host's certificate chain is checked for the following:
 
